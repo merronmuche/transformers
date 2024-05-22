@@ -2,7 +2,7 @@
 
 import tensorflow as tf
 import math
-
+from tensorflow.keras import layers
 
 class TFPhi3RMSNorm(tf.keras.layers.Layer):
     def __init__(self, hidden_size, eps=1e-6, **kwargs):
@@ -224,18 +224,147 @@ def repeat_kv(hidden_states: tf.Tensor, n_rep: int) -> tf.Tensor:
     hidden_states = tf.tile(hidden_states, [1, 1, n_rep, 1, 1])  # Shape: (batch, num_key_value_heads, n_rep, seqlen, head_dim)
     return tf.reshape(hidden_states, [batch, num_key_value_heads * n_rep, slen, head_dim])
 
+# class Phi3Attention(tf.keras.layers.Layer):
+#     """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+#     def __init__(self, config, layer_idx=None, **kwargs):
+#         super(Phi3Attention, self).__init__(**kwargs)
+#         self.config = config
+#         self.layer_idx = layer_idx
+
+#         if layer_idx is None:
+#             print(f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
+#                   "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
+#                   "when creating this class.")
+
+#         self.attention_dropout = config.attention_dropout
+#         self.hidden_size = config.hidden_size
+#         self.num_heads = config.num_attention_heads
+#         self.head_dim = self.hidden_size // self.num_heads
+#         self.num_key_value_heads = config.num_key_value_heads
+#         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+#         self.max_position_embeddings = config.max_position_embeddings
+#         self.original_max_position_embeddings = config.original_max_position_embeddings
+#         self.rope_theta = config.rope_theta
+#         self.rope_scaling = config.rope_scaling
+#         self.is_causal = True
+
+#         if (self.head_dim * self.num_heads) != self.hidden_size:
+#             raise ValueError(
+#                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+#                 f" and `num_heads`: {self.num_heads})."
+#             )
+
+#         op_size = self.num_heads * self.head_dim + 2 * (self.num_key_value_heads * self.head_dim)
+#         self.o_proj = tf.keras.layers.Dense(self.hidden_size, use_bias=False)
+#         self.qkv_proj = tf.keras.layers.Dense(op_size, use_bias=False)
+#         self._init_rope()
+
+#     def _init_rope(self):
+#         if self.rope_scaling is None:
+#             self.rotary_emb = TFPhi3RotaryEmbedding(
+#                 self.head_dim,
+#                 max_position_embeddings=self.max_position_embeddings,
+#                 base=self.rope_theta,
+#             )
+#         else:
+#             scaling_type = self.config.rope_scaling["type"]
+#             if scaling_type == "su":
+#                 self.rotary_emb = TFPhi3SuScaledRotaryEmbedding(self.head_dim, self.config)
+#             elif scaling_type == "yarn":
+#                 self.rotary_emb = Phi3YarnScaledRotaryEmbedding(self.head_dim, self.config)
+#             else:
+#                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+
+#     def call(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False):
+#         print("You are not running the flash-attention implementation, expect numerical differences.")
+
+#         bsz, q_len, _ = tf.shape(hidden_states)
+
+#         qkv = self.qkv_proj(hidden_states)
+#         query_pos = self.num_heads * self.head_dim
+#         query_states = qkv[..., :query_pos]
+#         key_states = qkv[..., query_pos : query_pos + self.num_key_value_heads * self.head_dim]
+#         value_states = qkv[..., query_pos + self.num_key_value_heads * self.head_dim :]
+
+#         query_states = tf.reshape(query_states, [bsz, q_len, self.num_heads, self.head_dim])
+#         query_states = tf.transpose(query_states, [0, 2, 1, 3])
+#         key_states = tf.reshape(key_states, [bsz, q_len, self.num_key_value_heads, self.head_dim])
+#         key_states = tf.transpose(key_states, [0, 2, 1, 3])
+#         value_states = tf.reshape(value_states, [bsz, q_len, self.num_key_value_heads, self.head_dim])
+#         value_states = tf.transpose(value_states, [0, 2, 1, 3])
+
+#         kv_seq_len = tf.shape(key_states)[-2]
+#         if past_key_value is not None:
+#             if self.layer_idx is None:
+#                 raise ValueError(
+#                     f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+#                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+#                     "with a layer index."
+#                 )
+#             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+#         cos, sin = self.rotary_emb(value_states, position_ids, seq_len=kv_seq_len)
+
+#         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+#         if past_key_value is not None:
+#             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+#             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+#         # repeat k/v heads if n_kv_heads < n_heads
+#         key_states = repeat_kv(key_states, self.num_key_value_groups)
+#         value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+#         attn_weights = tf.matmul(query_states, key_states, transpose_b=True) / math.sqrt(self.head_dim)
+
+#         if tf.shape(attn_weights) != (bsz, self.num_heads, q_len, kv_seq_len):
+#             raise ValueError(
+#                 f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+#                 f" {tf.shape(attn_weights)}"
+#             )
+
+#         if attention_mask is not None:
+#             if tf.shape(attention_mask) != (bsz, 1, q_len, kv_seq_len):
+#                 raise ValueError(
+#                     f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {tf.shape(attention_mask)}"
+#                 )
+#             attn_weights += attention_mask
+
+#         # upcast attention to fp32
+#         attn_weights = tf.nn.softmax(attn_weights, axis=-1, dtype=tf.float32)
+#         attn_weights = tf.nn.dropout(attn_weights, rate=self.attention_dropout)
+
+#         attn_output = tf.matmul(attn_weights, value_states)
+
+#         if tf.shape(attn_output) != (bsz, self.num_heads, q_len, self.head_dim):
+#             raise ValueError(
+#                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+#                 f" {tf.shape(attn_output)}"
+#             )
+
+#         attn_output = tf.transpose(attn_output, [0, 2, 1, 3])
+#         attn_output = tf.reshape(attn_output, [bsz, q_len, self.hidden_size])
+
+#         attn_output = self.o_proj(attn_output)
+
+#         if not output_attentions:
+#             attn_weights = None
+
+#         return attn_output, attn_weights, past_key_value
+
 class Phi3Attention(tf.keras.layers.Layer):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config, layer_idx=None, **kwargs):
-        super(Phi3Attention, self).__init__(**kwargs)
+    def __init__(self, config, layer_idx=None):
+        super(Phi3Attention, self).__init__()
         self.config = config
         self.layer_idx = layer_idx
-
         if layer_idx is None:
-            print(f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
-                  "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
-                  "when creating this class.")
+            tf.print(
+                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
+                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )
 
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
@@ -256,8 +385,8 @@ class Phi3Attention(tf.keras.layers.Layer):
             )
 
         op_size = self.num_heads * self.head_dim + 2 * (self.num_key_value_heads * self.head_dim)
-        self.o_proj = tf.keras.layers.Dense(self.hidden_size, use_bias=False)
-        self.qkv_proj = tf.keras.layers.Dense(op_size, use_bias=False)
+        self.o_proj = layers.Dense(self.hidden_size, use_bias=False)
+        self.qkv_proj = layers.Dense(op_size, use_bias=False)
         self._init_rope()
 
     def _init_rope(self):
@@ -268,16 +397,10 @@ class Phi3Attention(tf.keras.layers.Layer):
                 base=self.rope_theta,
             )
         else:
-            scaling_type = self.config.rope_scaling["type"]
-            if scaling_type == "su":
-                self.rotary_emb = TFPhi3SuScaledRotaryEmbedding(self.head_dim, self.config)
-            elif scaling_type == "yarn":
-                self.rotary_emb = Phi3YarnScaledRotaryEmbedding(self.head_dim, self.config)
-            else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+            raise NotImplementedError("RoPE scaling not implemented in this example.")
 
     def call(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False):
-        print("You are not running the flash-attention implementation, expect numerical differences.")
+        tf.print("You are not running the flash-attention implementation, expect numerical differences.")
 
         bsz, q_len, _ = tf.shape(hidden_states)
 
@@ -287,12 +410,9 @@ class Phi3Attention(tf.keras.layers.Layer):
         key_states = qkv[..., query_pos : query_pos + self.num_key_value_heads * self.head_dim]
         value_states = qkv[..., query_pos + self.num_key_value_heads * self.head_dim :]
 
-        query_states = tf.reshape(query_states, [bsz, q_len, self.num_heads, self.head_dim])
-        query_states = tf.transpose(query_states, [0, 2, 1, 3])
-        key_states = tf.reshape(key_states, [bsz, q_len, self.num_key_value_heads, self.head_dim])
-        key_states = tf.transpose(key_states, [0, 2, 1, 3])
-        value_states = tf.reshape(value_states, [bsz, q_len, self.num_key_value_heads, self.head_dim])
-        value_states = tf.transpose(value_states, [0, 2, 1, 3])
+        query_states = tf.transpose(tf.reshape(query_states, (bsz, q_len, self.num_heads, self.head_dim)), perm=[0, 2, 1, 3])
+        key_states = tf.transpose(tf.reshape(key_states, (bsz, q_len, self.num_key_value_heads, self.head_dim)), perm=[0, 2, 1, 3])
+        value_states = tf.transpose(tf.reshape(value_states, (bsz, q_len, self.num_key_value_heads, self.head_dim)), perm=[0, 2, 1, 3])
 
         kv_seq_len = tf.shape(key_states)[-2]
         if past_key_value is not None:
@@ -311,39 +431,38 @@ class Phi3Attention(tf.keras.layers.Layer):
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         attn_weights = tf.matmul(query_states, key_states, transpose_b=True) / math.sqrt(self.head_dim)
 
-        if tf.shape(attn_weights) != (bsz, self.num_heads, q_len, kv_seq_len):
+        if tuple(tf.shape(attn_weights).numpy()) != (bsz.numpy(), self.num_heads, q_len.numpy(), kv_seq_len.numpy()):
             raise ValueError(
                 f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
                 f" {tf.shape(attn_weights)}"
             )
 
         if attention_mask is not None:
-            if tf.shape(attention_mask) != (bsz, 1, q_len, kv_seq_len):
+            if tuple(tf.shape(attention_mask).numpy()) != (bsz.numpy(), 1, q_len.numpy(), kv_seq_len.numpy()):
                 raise ValueError(
                     f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {tf.shape(attention_mask)}"
                 )
-            attn_weights += attention_mask
+            attn_weights = attn_weights + attention_mask
 
-        # upcast attention to fp32
-        attn_weights = tf.nn.softmax(attn_weights, axis=-1, dtype=tf.float32)
+        attn_weights = tf.nn.softmax(attn_weights, axis=-1)
+        attn_weights = tf.cast(attn_weights, dtype=value_states.dtype)
         attn_weights = tf.nn.dropout(attn_weights, rate=self.attention_dropout)
 
         attn_output = tf.matmul(attn_weights, value_states)
 
-        if tf.shape(attn_output) != (bsz, self.num_heads, q_len, self.head_dim):
+        if tuple(tf.shape(attn_output).numpy()) != (bsz.numpy(), self.num_heads, q_len.numpy(), self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
                 f" {tf.shape(attn_output)}"
             )
 
-        attn_output = tf.transpose(attn_output, [0, 2, 1, 3])
-        attn_output = tf.reshape(attn_output, [bsz, q_len, self.hidden_size])
+        attn_output = tf.transpose(attn_output, perm=[0, 2, 1, 3])
+        attn_output = tf.reshape(attn_output, (bsz, q_len, self.hidden_size))
 
         attn_output = self.o_proj(attn_output)
 
@@ -351,7 +470,5 @@ class Phi3Attention(tf.keras.layers.Layer):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
-
-
 
 
